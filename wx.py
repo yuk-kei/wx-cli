@@ -12,8 +12,10 @@ wx - 微信本地数据 CLI
   wx daemon status/stop/logs daemon 管理
 """
 
+import glob
 import json
 import os
+import platform
 import socket
 import subprocess
 import sys
@@ -104,6 +106,145 @@ def _parse_time(value: str, is_end: bool = False) -> int:
 @click.version_option("0.1.0", prog_name="wx")
 def cli():
     """wx — 微信本地数据 CLI"""
+
+
+# ─── init ────────────────────────────────────────────────────────────────────
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+CONFIG_FILE = os.path.join(SCRIPT_DIR, "config.json")
+
+
+def _detect_db_dir() -> str | None:
+    """自动检测微信数据库目录（支持 macOS/Linux）。"""
+    if platform.system() == "Darwin":
+        pattern = os.path.expanduser(
+            "~/Library/Containers/com.tencent.xinWeChat/Data/Documents"
+            "/xwechat_files/*/db_storage"
+        )
+        candidates = sorted(
+            (p for p in glob.glob(pattern) if os.path.isdir(p)),
+            key=os.path.getmtime,
+            reverse=True,
+        )
+        return candidates[0] if candidates else None
+    if platform.system() == "Linux":
+        patterns = [
+            os.path.expanduser("~/Documents/xwechat_files/*/db_storage"),
+            os.path.expanduser("~/.local/share/weixin/data/db_storage"),
+        ]
+        candidates = []
+        for pat in patterns:
+            candidates.extend(p for p in glob.glob(pat) if os.path.isdir(p))
+        candidates.sort(key=os.path.getmtime, reverse=True)
+        return candidates[0] if candidates else None
+    return None
+
+
+def _ensure_scanner() -> str:
+    """确保 macOS C 扫描器已编译，返回二进制路径。"""
+    binary = os.path.join(SCRIPT_DIR, "find_all_keys_macos")
+    if os.path.exists(binary):
+        return binary
+    src = os.path.join(SCRIPT_DIR, "find_all_keys_macos.c")
+    if not os.path.exists(src):
+        raise click.ClickException(f"找不到扫描器源文件: {src}")
+    click.echo("编译密钥扫描器...", err=True)
+    # Try with Xcode SDK first, then fallback to plain clang
+    sdk_path = (
+        "/Applications/Xcode.app/Contents/Developer/Platforms"
+        "/MacOSX.platform/Developer/SDKs/MacOSX.sdk"
+    )
+    cmds = []
+    if os.path.isdir(sdk_path):
+        cmds.append(["clang", "-O2", "-isysroot", sdk_path, "-o", binary, src])
+    cmds.append(["clang", "-O2", "-o", binary, src])
+    for cmd in cmds:
+        ret = subprocess.run(cmd, capture_output=True, text=True)
+        if ret.returncode == 0:
+            click.echo("编译完成", err=True)
+            return binary
+    raise click.ClickException(f"编译失败: {ret.stderr.strip()}")
+
+
+@cli.command()
+@click.option('--force', is_flag=True, help='强制重新扫描（覆盖已有配置）')
+def init(force):
+    """初始化：检测数据目录并扫描加密密钥
+
+    \b
+    首次使用前运行（WeChat 需正在运行）：
+      wx init
+    重新扫描密钥（例如微信更新后）：
+      wx init --force
+    """
+    # Check if already initialized
+    if not force and os.path.exists(CONFIG_FILE):
+        try:
+            cfg = json.load(open(CONFIG_FILE, encoding='utf-8'))
+            db_dir = cfg.get("db_dir", "")
+            keys_file = cfg.get("keys_file", "all_keys.json")
+            if not os.path.isabs(keys_file):
+                keys_file = os.path.join(SCRIPT_DIR, keys_file)
+            if (db_dir and "your_wxid" not in db_dir
+                    and os.path.isdir(db_dir)
+                    and os.path.exists(keys_file)):
+                click.echo(f"已初始化，数据目录: {db_dir}")
+                click.echo("如需重新扫描密钥，使用 --force")
+                return
+        except Exception:
+            pass
+
+    # Step 1: Detect db_dir
+    click.echo("检测微信数据目录...")
+    db_dir = _detect_db_dir()
+    if not db_dir:
+        raise click.ClickException(
+            "未能自动检测到微信数据目录\n"
+            "请手动编辑 config.json 中的 db_dir 字段\n"
+            "路径格式（macOS）: ~/Library/Containers/com.tencent.xinWeChat/..."
+            "/xwechat_files/<wxid>/db_storage"
+        )
+    click.echo(f"找到数据目录: {db_dir}")
+
+    # Step 2: Compile scanner (macOS only)
+    if platform.system() == "Darwin":
+        scanner = _ensure_scanner()
+
+        # Step 3: Run key extraction
+        keys_file = os.path.join(SCRIPT_DIR, "all_keys.json")
+        click.echo("扫描加密密钥（需要 sudo 权限）...")
+        ret = subprocess.run(
+            ["sudo", scanner],
+            capture_output=False,   # let stdout/stderr pass through
+            cwd=SCRIPT_DIR,
+        )
+        if ret.returncode != 0:
+            raise click.ClickException("密钥扫描失败，请确认微信正在运行")
+        if not os.path.exists(keys_file):
+            raise click.ClickException(f"扫描完成但未找到输出文件: {keys_file}")
+        with open(keys_file, encoding='utf-8') as f:
+            keys = json.load(f)
+        real_keys = {k: v for k, v in keys.items() if not k.startswith('_')}
+        click.echo(f"成功提取 {len(real_keys)} 个数据库密钥")
+    else:
+        click.echo("非 macOS 系统，请手动运行密钥提取脚本")
+
+    # Step 4: Update config.json
+    cfg = {}
+    if os.path.exists(CONFIG_FILE):
+        try:
+            cfg = json.load(open(CONFIG_FILE, encoding='utf-8'))
+        except Exception:
+            pass
+    cfg["db_dir"] = db_dir
+    if "keys_file" not in cfg:
+        cfg["keys_file"] = "all_keys.json"
+    if "decrypted_dir" not in cfg:
+        cfg["decrypted_dir"] = "decrypted"
+    with open(CONFIG_FILE, "w", encoding='utf-8') as f:
+        json.dump(cfg, f, indent=4, ensure_ascii=False)
+    click.echo(f"配置已保存: {CONFIG_FILE}")
+    click.echo("初始化完成，可以使用 wx sessions / wx history 等命令了")
 
 
 # ─── sessions ────────────────────────────────────────────────────────────────
@@ -230,6 +371,64 @@ def contacts(query, limit, as_json):
     click.echo(f"共 {resp.get('total', len(data))} 个联系人（显示 {len(data)} 个）:\n")
     for c in data:
         click.echo(f"  {c['display']:<20} {c['username']}")
+
+
+# ─── export ──────────────────────────────────────────────────────────────────
+
+@cli.command()
+@click.argument('chat')
+@click.option('--since', default=None, metavar='DATE', help='起始时间 YYYY-MM-DD')
+@click.option('--until', default=None, metavar='DATE', help='结束时间 YYYY-MM-DD')
+@click.option('-n', '--limit', default=500, show_default=True, help='最多导出条数')
+@click.option('-f', '--format', 'fmt', type=click.Choice(['markdown', 'txt', 'json']),
+              default='markdown', show_default=True, help='输出格式')
+@click.option('-o', '--output', default=None, metavar='FILE', help='输出文件（默认 stdout）')
+def export(chat, since, until, limit, fmt, output):
+    """导出聊天记录到文件
+
+    \b
+    示例:
+      wx export "张三"
+      wx export "AI群" --since 2026-01-01 --format markdown -o chat.md
+      wx export "张三" --format json -o chat.json
+    """
+    req = {"cmd": "history", "chat": chat, "limit": limit, "offset": 0}
+    if since:
+        req["since"] = _parse_time(since)
+    if until:
+        req["until"] = _parse_time(until, is_end=True)
+
+    resp = _send(req, timeout=60)
+    messages = resp.get("messages", [])
+    chat_name = resp.get("chat", chat)
+    is_group = resp.get("is_group", False)
+    count = len(messages)
+
+    if fmt == 'json':
+        text = json.dumps(resp, ensure_ascii=False, indent=2)
+    elif fmt == 'txt':
+        lines = [f"=== {chat_name}{'[群]' if is_group else ''} ({count} 条) ===\n"]
+        for m in messages:
+            sender = f"{m['sender']}: " if m.get('sender') else ''
+            lines.append(f"[{m['time']}] {sender}{m['content']}")
+        text = '\n'.join(lines)
+    else:  # markdown
+        lines = [
+            f"# {chat_name}{'（群聊）' if is_group else ''}",
+            f"\n> 导出 {count} 条消息\n",
+        ]
+        for m in messages:
+            sender_md = f"**{m['sender']}**: " if m.get('sender') else ''
+            content = m['content'].replace('\n', '\n> ')
+            lines.append(f"### {m['time']}\n\n{sender_md}{content}\n")
+        text = '\n'.join(lines)
+
+    if output:
+        with open(output, 'w', encoding='utf-8') as f:
+            f.write(text)
+        click.echo(f"已导出 {count} 条消息到 {output}")
+    else:
+        click.echo(text)
 
 
 # ─── watch ───────────────────────────────────────────────────────────────────

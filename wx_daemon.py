@@ -213,6 +213,8 @@ MSG_DB_KEYS = sorted([
 
 _names: dict[str, str] | None = None
 _names_lock = threading.Lock()
+_md5_to_uname: dict[str, str] | None = None
+_md5_lock = threading.Lock()
 
 
 def _load_names() -> dict[str, str]:
@@ -235,12 +237,26 @@ def _load_names() -> dict[str, str]:
         return _names
 
 
+def _get_md5_lookup() -> dict[str, str]:
+    """返回 {md5(username): username}，用于全局搜索时从表名反推联系人。"""
+    global _md5_to_uname
+    with _md5_lock:
+        if _md5_to_uname is not None:
+            return _md5_to_uname
+        names = _load_names()
+        _md5_to_uname = {hashlib.md5(u.encode()).hexdigest(): u for u in names}
+        return _md5_to_uname
+
+
 def _refresh_names() -> None:
     """强制刷新联系人缓存（新联系人/新群加入时调用）"""
-    global _names
+    global _names, _md5_to_uname
     with _names_lock:
         _names = None
+    with _md5_lock:
+        _md5_to_uname = None
     _load_names()
+    _get_md5_lookup()
 
 # ─── 辅助 ─────────────────────────────────────────────────────────────────────
 
@@ -487,6 +503,7 @@ def q_search(keyword: str, chats: list[str] | None = None,
             for tbl in _find_msg_tables(uname):
                 targets.append((tbl['path'], tbl['table'], names.get(uname, uname), uname))
     else:
+        md5_lookup = _get_md5_lookup()
         for rel_key in MSG_DB_KEYS:
             path = _db.get(rel_key)
             if not path:
@@ -499,7 +516,9 @@ def q_search(keyword: str, chats: list[str] | None = None,
                 for (tname,) in table_rows:
                     if not re.fullmatch(r'Msg_[0-9a-f]{32}', tname):
                         continue
-                    targets.append((path, tname, '', ''))
+                    uname = md5_lookup.get(tname[4:], '')
+                    display = names.get(uname, uname) if uname else ''
+                    targets.append((path, tname, display, uname))
             except Exception:
                 continue
 
@@ -535,8 +554,7 @@ def q_search(keyword: str, chats: list[str] | None = None,
                         sender = _sender_label(real_sender_id, content, is_group or False,
                                                uname or '', id2u, names)
                         text = _fmt_content(local_id, local_type, content, is_group or False)
-                        # 全局搜索时从 table_name 反推 display（联系人缓存中查）
-                        chat_display = display or '未知'
+                        chat_display = display or uname or table
                         results.append({
                             "timestamp": ts,
                             "time":      datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M'),
