@@ -215,6 +215,12 @@ wx-cli 通过 macOS Mach VM API（`mach_vm_region` + `mach_vm_read`）或 Linux 
 
 ---
 
+## 致谢
+
+本项目受 [ylytdeng/wechat-decrypt](https://github.com/ylytdeng/wechat-decrypt) 启发，在其基础上进行了重新设计与实现。感谢原作者的研究与探索。
+
+---
+
 ## 免责声明
 
 本工具仅用于学习和研究目的，用于解密**自己的**微信数据。请遵守相关法律法规，不得用于未经授权的数据访问。
